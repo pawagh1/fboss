@@ -801,8 +801,13 @@ void MuxMachine::restoreState(void) {
   updateState(MuxState::COLLECTING_DISTRIBUTING);
 }
 
-Selector::Selector(LacpController& controller, uint8_t minLinkCount)
-    : controller_(controller), minLinkCount_(minLinkCount) {}
+Selector::Selector(
+    LacpController& controller,
+    uint8_t minLinkCount,
+    std::optional<uint8_t> minLinkCountToUp)
+    : controller_(controller),
+      minLinkCount_(minLinkCount),
+      minLinkCountToUp_(minLinkCountToUp) {}
 
 void Selector::start() {}
 
@@ -876,11 +881,26 @@ void Selector::select() {
           return s.lagID == targetLagID;
         });
 
-    if (targetLagMemberCount >= minLinkCount_) {
-      auto portsToSignal = getPortsWithSelection(
-          Selection(targetLagID, SelectionState::STANDBY));
+    auto minLinkCountToDown = minLinkCount_;
+    auto minLinkCountToUp = minLinkCountToUp_.value_or(minLinkCount_);
+    auto portsToSignal =
+        getPortsWithSelection(Selection(targetLagID, SelectionState::STANDBY));
+    // If count of selected or standby ports is more than minLinkCountToUp,
+    // Put all STANDBY ports into SELECTED state.
+    if (targetLagMemberCount >= minLinkCountToUp) {
       controller_.selected(
           folly::range(portsToSignal.begin(), portsToSignal.end()));
+    } else {
+      // If count of selected ports is >= minLinkCountToDown, then the LAG is in
+      // UP state. Also Put all STANDBY ports into SELECTED state.
+      auto selectedPortsCount =
+          getPortsWithSelection(
+              Selection(targetLagID, SelectionState::SELECTED))
+              .size();
+      if (selectedPortsCount >= minLinkCountToDown) {
+        controller_.selected(
+            folly::range(portsToSignal.begin(), portsToSignal.end()));
+      }
     }
   }
 
@@ -960,6 +980,9 @@ void Selector::unselected() {
   auto ports =
       getPortsWithSelection(Selection(myLagID, SelectionState::SELECTED));
 
+  // If two thresholds [minLinkCount_, minLinkCountToUp_] are configured for
+  // min-links check, we still only need to put all selected ports into STANDBY
+  // state if the low threshold is not met.
   if (ports.size() < minLinkCount_) {
     controller_.standby(folly::range(ports.begin(), ports.end()));
   } else {
@@ -986,8 +1009,10 @@ void Selector::restoreState() {
   auto targetLagID = LinkAggregationGroupID::from(
       controller_.actorInfo(), controller_.partnerInfo());
 
-  Selector::portToSelection().insert(std::make_pair(
-      controller_.portID(), Selection(targetLagID, SelectionState::SELECTED)));
+  Selector::portToSelection().insert(
+      std::make_pair(
+          controller_.portID(),
+          Selection(targetLagID, SelectionState::SELECTED)));
 
   XLOG(DBG4) << "Selection[" << controller_.portID() << "]: selected "
              << targetLagID.describe();
